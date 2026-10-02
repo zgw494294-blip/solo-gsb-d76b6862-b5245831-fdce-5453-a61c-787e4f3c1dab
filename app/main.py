@@ -223,6 +223,46 @@ async def toggle_isolation_pipe(job_id: str, request: Request) -> JSONResponse:
     })
 
 
+def _rehearsal_conflict_response(base_version: int,
+                                 current_version: int) -> JSONResponse:
+    """预演计算出口发现版本已变：409 并带当前 current_version。"""
+    return JSONResponse(status_code=409, content={
+        "ok": False,
+        "error": (
+            f"版本冲突：请求携带的版本为 {base_version}，"
+            f"作业当前版本已为 {current_version}；预演基于旧版本完成，"
+            "其关闭集合或需水量可能已不是当前状态，请重新读取最新快照后再试。"),
+        "current_version": current_version})
+
+
+def _rehearsal_exit_review(job_id: str, request_version: Any, *,
+                           check_version: bool = True) -> JSONResponse | None:
+    """预演的**所有计算出口**统一复核，严格按以下优先级给出结论：
+
+      1. 作业已结束（或未知）——返回 404（结束优先于一切，包括冲突与错误）；
+      2. ``check_version`` 为真且作业仍存在、版本已推进——返回 409 与
+         current_version；
+      3. 作业存续且版本未变（或不做版本复核）——放行（返回 None），由调用方
+         处理原结果或原错误。
+
+    ``check_version`` 仅对“真正基于 request_version 完成了一段计算/或本身即
+    版本冲突”的出口开启：同步入参校验失败（含 version 非法，如负数、布尔、
+    字符串）时并未开始任何基于该版本的计算，结束复核仍优先（404），但不得把
+    负版本号这类非法输入改判成 409——版本比对只在 ``request_version`` 为
+    非布尔整数时参与。
+    """
+    try:
+        current = get_snapshot(job_id)
+    except JobNotFoundError:
+        return _isolation_error(JobNotFoundError(job_id))
+    valid_version = (isinstance(request_version, int)
+                     and not isinstance(request_version, bool))
+    if (check_version and valid_version
+            and current["version"] != request_version):
+        return _rehearsal_conflict_response(request_version, current["version"])
+    return None
+
+
 @app.post("/api/isolation-jobs/{job_id}/rehearsal")
 async def rehearse_isolation_plan(job_id: str, request: Request) -> JSONResponse:
     """预演 2～6 根互异现有管段的可执行切换顺序，不实际操作作业。
@@ -232,37 +272,55 @@ async def rehearse_isolation_plan(job_id: str, request: Request) -> JSONResponse
     最低水头与稳态收敛（所有中间状态与终态均须合法），按管段录入序号序列
     的字典序取最小可行顺序。搜索途中求解不收敛或出现非有限数时结论为
     “无法确认”，绝不当作不可行。预演不推进版本、不改需水量或快照；搜索
-    在工作线程进行，不阻塞读取与其他作业。
+    在工作线程进行，不持作业锁，不阻塞读取、结束与其他作业。
 
-    请求时或计算结束时版本已变返回 409 与 current_version；未知或已结束
-    作业返回 404——结束优先于冲突及计算错误（计算结束后才结束的作业同样
-    按 404，不返回 200/422/409）。
+    计算的**每一个出口**（正常算完、原有业务异常、意外异常）都先经
+    ``_rehearsal_exit_review`` 复核，响应优先级固定为：
+
+      * 作业已结束（含计算途中被结束）——一律 404，绝不恢复已结束作业、
+        绝不覆盖新状态，也不会改报 200/409/422；
+      * 作业仍存在但版本已被推进——409 并带 current_version；
+      * 作业存续且版本未变——正常结果返回 200，原有业务错误（422/409）
+        保持原语义；搜索抛出的 RuntimeError 等**意外异常**不属于
+        infeasible/not_confirmed，仍按原服务器错误（500）抛出，绝不改报
+        “不可行”或“无法确认”。
     """
     payload, bad = await _load_payload(
         request,
         empty_hint="请求体为空，请提供 version（作业当前版本号）与 pipes（2～6 根互异现有管段编号）。")
     if bad is not None:
         return bad
+    request_version = payload.get("version") if isinstance(payload, dict) else None
+
+    # 计算在工作线程进行：搜索全程不持作业锁，读取、结束与其他作业均可并发
     try:
         result = await run_in_threadpool(rehearse_switch_plan, job_id, payload)
     except _ISOLATION_ERRORS as exc:
-        # rehearse_switch_plan 在锁外计算期间无法观察结束/版本变化：这里的
-        # 映射只覆盖入参校验等同步抛出的错误；计算结束后的二次核对在下方。
+        # 这些错误都在搜索开始前的短暂临界区（入参归属、版本与字段校验）
+        # 同步抛出，计算尚未开始：出口仍先复核结束（404 优先）。只有“版本
+        # 冲突”本身才顺带刷新 current_version；入参校验类错误（version 非法
+        # 如负数、pipes 非法等）不做版本比对，保持原 422，绝不把负版本号
+        # 改判成 409。
+        override = _rehearsal_exit_review(
+            job_id, request_version,
+            check_version=isinstance(exc, VersionConflictError))
+        if override is not None:
+            return override
         return _isolation_error(exc)
+    except Exception:
+        # 搜索期间的意外异常（RuntimeError 等，非 SolverNotConverged 等业务
+        # 错误）：绝不改报“不可行/无法确认”。先复核结束标记与版本——
+        # 已结束 404、版本已推进 409；仅当作业存续且版本未变时才让该意外
+        # 异常按原服务器错误逸出（FastAPI 记日志并返回 500）。
+        override = _rehearsal_exit_review(job_id, request_version)
+        if override is not None:
+            return override
+        raise
 
-    # 计算结束时再次核对：结束优先于版本冲突（若二者同时成立，按 404）
-    try:
-        current = get_snapshot(job_id)
-    except JobNotFoundError:
-        return _isolation_error(JobNotFoundError(job_id))
-    if current["version"] != result["base_version"]:
-        return JSONResponse(status_code=409, content={
-            "ok": False,
-            "error": (
-                f"版本冲突：请求携带的版本为 {result['base_version']}，"
-                f"作业当前版本已为 {current['version']}；预演基于旧版本完成，"
-                "其关闭集合或需水量可能已不是当前状态，请重新读取最新快照后再试。"),
-            "current_version": current["version"]})
+    # 正常计算出口：结束优先于版本冲突（若二者同时成立，按 404）
+    override = _rehearsal_exit_review(job_id, result["base_version"])
+    if override is not None:
+        return override
     return JSONResponse(content={"ok": True, "rehearsal": result})
 
 

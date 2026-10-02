@@ -587,6 +587,137 @@ def test_rehearse_does_not_affect_other_jobs():
     assert got_b["source_supply"] == pytest.approx(2.0)
 
 
+# ---- 出口复核优先级：搜索抛 RuntimeError 等意外异常时的 404/409/500 分流 ---- #
+def test_rehearse_terminated_inside_search_then_runtime_error_is_404(monkeypatch):
+    """搜索的首次求解里先结束作业、再抛 RuntimeError：出口按 404（而非 500）。"""
+    job = _create(_loop_payload(allow=["A", "B"]))
+    jid = job["job_id"]
+    state = {"fired": False}
+
+    def boom_after_terminate(net):
+        if not state["fired"]:
+            state["fired"] = True
+            # 模拟计算途中作业被另一请求结束（预演搜索不持作业锁，可立即生效）
+            iso.terminate_job(jid)
+            raise RuntimeError("模拟预演搜索期间的意外异常")
+        return iso.solve_network(net)
+
+    monkeypatch.setattr(iso, "solve_network", boom_after_terminate)
+    resp = _rehearse(jid, 0, ["P1", "P2"])
+    assert resp.status_code == 404
+    assert "不存在" in resp.json()["error"]
+    assert client.get(f"/api/isolation-jobs/{jid}").status_code == 404
+
+
+def test_rehearse_version_advanced_inside_search_then_runtime_error_is_409(
+        monkeypatch):
+    """搜索的首次求解里先推进版本、再抛 RuntimeError：出口按 409 带当前版本。"""
+    job = _create(_loop_payload(allow=["A", "B"]))
+    jid = job["job_id"]
+    real_solve = iso.solve_network
+    state = {"fired": False}
+
+    def advance_then_boom(net):
+        if not state["fired"]:
+            state["fired"] = True
+            # 用真实求解器完成一次合法切换推进版本（v0 -> v1），随后再抛意外异常
+            monkeypatch.setattr(iso, "solve_network", real_solve)
+            iso.toggle_pipe(jid, {"version": 0, "pipe_id": "P3"})
+            raise RuntimeError("模拟预演搜索期间的意外异常")
+        return real_solve(net)
+
+    monkeypatch.setattr(iso, "solve_network", advance_then_boom)
+    resp = _rehearse(jid, 0, ["P1", "P2"])
+    assert resp.status_code == 409
+    data = resp.json()
+    assert data["ok"] is False and data["current_version"] == 1
+    assert "版本冲突" in data["error"]
+    # RuntimeError 不得覆盖新提交的状态
+    got = client.get(f"/api/isolation-jobs/{jid}").json()["job"]
+    assert got["version"] == 1 and got["closed_pipes"] == ["P3"]
+
+
+def test_rehearse_terminate_and_advance_inside_search_then_error_is_404(
+        monkeypatch):
+    """搜索中先推进版本再结束作业、随后抛 RuntimeError：404（结束优先于冲突）。"""
+    job = _create(_loop_payload(allow=["A", "B"]))
+    jid = job["job_id"]
+    real_solve = iso.solve_network
+    state = {"fired": False}
+
+    def advance_terminate_then_boom(net):
+        if not state["fired"]:
+            state["fired"] = True
+            monkeypatch.setattr(iso, "solve_network", real_solve)
+            iso.toggle_pipe(jid, {"version": 0, "pipe_id": "P3"})  # v0 -> v1
+            iso.terminate_job(jid)
+            raise RuntimeError("模拟预演搜索期间的意外异常")
+        return real_solve(net)
+
+    monkeypatch.setattr(iso, "solve_network", advance_terminate_then_boom)
+    resp = _rehearse(jid, 0, ["P1", "P2"])
+    assert resp.status_code == 404  # 而非 409/500
+    assert "不存在" in resp.json()["error"]
+
+
+def test_rehearse_unchanged_job_runtime_error_is_server_500(monkeypatch):
+    """作业存续且版本未变时搜索抛 RuntimeError：保持原服务器错误 500。
+
+    绝不能把它改报成 infeasible/not_confirmed（业务结论），也不是 409/404。
+    """
+    job = _create(_loop_payload(allow=["A", "B"]))
+    jid = job["job_id"]
+    real_solve = iso.solve_network
+    state = {"fired": False}
+
+    def boom_once(net):
+        if not state["fired"]:
+            state["fired"] = True
+            raise RuntimeError("模拟预演搜索期间的意外异常")
+        return real_solve(net)
+
+    monkeypatch.setattr(iso, "solve_network", boom_once)
+    # raise_server_exceptions=False：把未捕获异常按真实 HTTP 500 返回捕获
+    with TestClient(app, raise_server_exceptions=False) as err_client:
+        resp = err_client.post(f"/api/isolation-jobs/{jid}/rehearsal",
+                               json={"version": 0, "pipes": ["P1", "P2"]})
+    assert resp.status_code == 500
+    assert "infeasible" not in resp.text and "not_confirmed" not in resp.text
+    # 作业未被改变（只读）：仍为版本 0、无关闭管段
+    got = client.get(f"/api/isolation-jobs/{jid}").json()["job"]
+    assert got["version"] == 0 and got["closed_pipes"] == []
+    # 修复后同版本预演仍可正常得出原业务结论（环网允许 A、B 失供时可行）
+    d = _rehearsal(jid, 0, ["P1", "P2", "P3"])
+    assert d["status"] == "feasible"
+    assert d["plan"]["pipe_order"] == ["P3", "P1", "P2"]
+
+
+def test_rehearse_solver_not_converged_is_not_confirmed_not_500(monkeypatch):
+    """对照：业务性 SolverNotConverged 仍归 not_confirmed（200），不是 500。
+
+    只有 RuntimeError 这类“意外异常”才走服务器错误；求解不收敛是搜索已定义
+    的三态之一。环网首状态 {P1} 全连通必调求解器，令其一次性不收敛。
+    """
+    job = _create(_loop_payload(allow=["A", "B"]))
+    jid = job["job_id"]
+    real_solve = iso.solve_network
+    state = {"fired": False}
+
+    def fail_once(net):
+        if not state["fired"]:
+            state["fired"] = True
+            raise SolverNotConverged("模拟某关闭集合不收敛")
+        return real_solve(net)
+
+    monkeypatch.setattr(iso, "solve_network", fail_once)
+    resp = _rehearse(jid, 0, ["P1", "P2"])
+    assert resp.status_code == 200
+    d = resp.json()["rehearsal"]
+    assert d["status"] == "not_confirmed"
+    assert d["minimum_confirmed"] is False
+
+
+
 # ------------------ 计算期间的 HTTP 并发（可暂停求解门 + 真实 Uvicorn） ------------------ #
 class _PausableCompute:
     """与 test_isolation 同款的求解门：命中 (job_id, stage, closed) 时阻塞。"""
@@ -608,6 +739,55 @@ class _PausableCompute:
         self.arrived.set()
         if not self.released.wait(timeout=self._hold):
             raise AssertionError("求解门在超时内未被放行，测试疑似死锁")
+
+
+class _PausableFailingCompute:
+    """暂停并放行的计算替身：门放行后让本次预演搜索的首次求解抛“意外异常”。
+
+    与 ``_PausableCompute`` 一样在 (job_id, "rehearse") 命中时阻塞，但放行的
+    瞬间才把 ``iso.solve_network`` 换成一次性替身——搜索随后的第 1 次状态
+    评估直接抛出 ``error``（默认 ``RuntimeError``，区别于业务性的
+    ``SolverNotConverged``：后者会被搜索归为 not_confirmed，前者必须原样
+    逸出，由出口复核决定 404/409/500）。
+
+    替身只在**放行之后**安装并“上膛”，且只命中一次：暂停期间用来推进版本
+    的并发切换/修订仍走真实求解器，绝不被这个失败替身污染。这正是用于确定
+    “搜索抛出意外异常的同一时刻，作业已结束 / 版本已推进 / 作业未变化”
+    三种交错顺序的手段。
+    """
+
+    def __init__(self, *, job_id, monkeypatch, hold_seconds=5.0,
+                 error=RuntimeError, message="模拟预演搜索期间的意外异常"):
+        self._want_job = job_id
+        self._hold = hold_seconds
+        self._monkeypatch = monkeypatch
+        self._error = error
+        self._message = message
+        self._claimed = threading.Lock()
+        self.arrived = threading.Event()
+        self.released = threading.Event()
+        self.fail_armed = False  # 放行后上膛；替身首次命中后自动退膛
+
+    def __call__(self, gate_job_id, stage, *, version, closed):
+        if stage != "rehearse" or gate_job_id != self._want_job:
+            return
+        if not self._claimed.acquire(blocking=False):
+            return
+        self.arrived.set()
+        if not self.released.wait(timeout=self._hold):
+            raise AssertionError("求解门在超时内未被放行，测试疑似死锁")
+        real_solve = iso.solve_network
+
+        def failing(net):
+            if self.fail_armed:
+                self.fail_armed = False  # 一次性：只让搜索的首次评估炸
+                raise self._error(self._message)
+            return real_solve(net)
+
+        # 先上膛再换替身：两者都在本（预演）线程放行后、搜索继续前完成，
+        # 暂停期间的并发操作不会看到这个替身。
+        self.fail_armed = True
+        self._monkeypatch.setattr(iso, "solve_network", failing)
 
 
 import socket  # noqa: E402
@@ -779,3 +959,155 @@ def test_http_rehearse_terminate_and_version_both_ended_is_404(server, monkeypat
     gate.released.set()
     t_reh.join(timeout=5)
     assert res_reh["response"].status_code == 404
+
+
+# --- 意外异常（RuntimeError 等）与结束/版本推进的交错：出口复核优先级回归 --- #
+def test_http_rehearse_terminated_during_compute_unexpected_error_is_404(
+        server, monkeypatch):
+    """合法预演搜索暂停期间结束作业，放行后搜索抛 RuntimeError：仍按 404。
+
+    回归点：意外异常曾经直接逸出成 500、跳过结束复核。修复后所有计算出口
+    先复核——已结束一律 404（结束优先于冲突与计算错误），且绝不恢复作业。
+    用环网 P1/P2 预演：DFS 首状态 {P1} 全连通，必调用求解器，替身一定命中。
+    """
+    job = _create_on(server, _loop_payload(allow=["A", "B"]))
+    jid = job["job_id"]
+    gate = _PausableFailingCompute(job_id=jid, monkeypatch=monkeypatch)
+    monkeypatch.setattr(iso, "_COMPUTE_GATE", gate)
+
+    t_reh, res_reh = _post_async_on(
+        server, f"/api/isolation-jobs/{jid}/rehearsal",
+        {"version": 0, "pipes": ["P1", "P2"]})
+    assert gate.arrived.wait(timeout=5)
+    # 暂停期间健康检查、读取照常
+    assert server.get("/api/health").status_code == 200
+    assert server.get(f"/api/isolation-jobs/{jid}").json()["job"]["version"] == 0
+    # 结束立即返回（不等待在途计算）
+    assert server.delete(f"/api/isolation-jobs/{jid}").status_code == 200
+
+    # 放行：搜索继续即抛 RuntimeError（本会是 500），但作业已结束 -> 404
+    gate.released.set()
+    t_reh.join(timeout=5)
+    response = res_reh["response"]
+    assert response.status_code == 404
+    assert "不存在" in response.json()["error"]
+    # 预演没有复活作业、没有提交任何状态
+    assert server.get(f"/api/isolation-jobs/{jid}").status_code == 404
+
+
+def test_http_rehearse_version_advanced_then_unexpected_error_is_409(
+        server, monkeypatch):
+    """搜索暂停期间版本被推进，放行后搜索抛 RuntimeError：返回 409。
+
+    回归点：意外异常曾经跳过版本复核直接 500。修复后作业仍存在但版本已变
+    时返回 409 与 current_version，且异常不得改报 infeasible/not_confirmed。
+    暂停期间用真实求解器关 P3（合法）推进版本，再让被暂停预演的搜索炸掉。
+    """
+    job = _create_on(server, _loop_payload(allow=["A", "B"]))
+    jid = job["job_id"]
+    gate = _PausableFailingCompute(job_id=jid, monkeypatch=monkeypatch)
+    monkeypatch.setattr(iso, "_COMPUTE_GATE", gate)
+
+    t_reh, res_reh = _post_async_on(
+        server, f"/api/isolation-jobs/{jid}/rehearsal",
+        {"version": 0, "pipes": ["P1", "P2"]})
+    assert gate.arrived.wait(timeout=5)
+    # 暂停期间成功切换：v0 -> v1（走真实求解器，未被失败替身影响）
+    resp = server.post(f"/api/isolation-jobs/{jid}/toggle",
+                       json={"version": 0, "pipe_id": "P3"})
+    assert resp.status_code == 200 and resp.json()["job"]["version"] == 1
+
+    gate.released.set()
+    t_reh.join(timeout=5)
+    response = res_reh["response"]
+    assert response.status_code == 409
+    data = response.json()
+    assert data["ok"] is False and data["current_version"] == 1
+    assert "版本冲突" in data["error"]
+    # 作业是切换提交的 v1，RuntimeError 没有覆盖新状态
+    got = server.get(f"/api/isolation-jobs/{jid}").json()["job"]
+    assert got["version"] == 1 and got["closed_pipes"] == ["P3"]
+
+
+def test_http_rehearse_terminate_and_advance_then_unexpected_error_is_404(
+        server, monkeypatch):
+    """版本已推进且作业已结束、搜索随后抛 RuntimeError：404（结束最高优先）。"""
+    job = _create_on(server, _loop_payload(allow=["A", "B"]))
+    jid = job["job_id"]
+    gate = _PausableFailingCompute(job_id=jid, monkeypatch=monkeypatch)
+    monkeypatch.setattr(iso, "_COMPUTE_GATE", gate)
+
+    t_reh, res_reh = _post_async_on(
+        server, f"/api/isolation-jobs/{jid}/rehearsal",
+        {"version": 0, "pipes": ["P1", "P2"]})
+    assert gate.arrived.wait(timeout=5)
+    assert server.post(f"/api/isolation-jobs/{jid}/toggle",
+                       json={"version": 0, "pipe_id": "P3"}).status_code == 200
+    assert server.delete(f"/api/isolation-jobs/{jid}").status_code == 200
+
+    gate.released.set()
+    t_reh.join(timeout=5)
+    response = res_reh["response"]
+    assert response.status_code == 404  # 而非 409/500
+    assert "不存在" in response.json()["error"]
+
+
+def test_http_rehearse_unchanged_job_unexpected_error_stays_500(
+        server, monkeypatch):
+    """作业存续且版本未变时搜索抛 RuntimeError：仍按原服务器错误 500 处理。
+
+    不得改报 infeasible（200）或 not_confirmed（200）；作业保持只读不变。
+    """
+    job = _create_on(server, _loop_payload(allow=["A", "B"]))
+    jid = job["job_id"]
+    gate = _PausableFailingCompute(job_id=jid, monkeypatch=monkeypatch)
+    monkeypatch.setattr(iso, "_COMPUTE_GATE", gate)
+
+    t_reh, res_reh = _post_async_on(
+        server, f"/api/isolation-jobs/{jid}/rehearsal",
+        {"version": 0, "pipes": ["P1", "P2"]})
+    assert gate.arrived.wait(timeout=5)
+    # 不结束、不推进版本，直接放行让搜索抛 RuntimeError
+    gate.released.set()
+    t_reh.join(timeout=5)
+    response = res_reh["response"]
+    assert response.status_code == 500
+    body = response.text
+    assert "infeasible" not in body and "not_confirmed" not in body
+    # 作业未变化：版本/关闭集合/快照都保持预演前。500 是未捕获异常，Uvicorn
+    # 会复位该 keep-alive 连接，故用新连接核对作业（与业务语义无关）。
+    with httpx.Client(base_url=str(server.base_url), timeout=10) as fresh:
+        got = fresh.get(f"/api/isolation-jobs/{jid}").json()["job"]
+    assert got["version"] == 0 and got["closed_pipes"] == []
+
+
+def test_http_rehearse_unchanged_job_business_error_stays_not_confirmed(
+        server, monkeypatch):
+    """对照：业务性的 SolverNotConverged 在搜索中仍归 not_confirmed（200）。
+
+    只有 RuntimeError 这类意外异常才按 500；求解不收敛始终是业务结论。
+    环网首状态 {P1} 全连通，替身一次性抛 SolverNotConverged，后续状态仍走
+    真实求解器，整体结论为 not_confirmed 而非 500。
+    """
+    job = _create_on(server, _loop_payload(allow=["A", "B"]))
+    jid = job["job_id"]
+    gate = _PausableFailingCompute(
+        job_id=jid, monkeypatch=monkeypatch, error=SolverNotConverged,
+        message="模拟某关闭集合不收敛")
+    monkeypatch.setattr(iso, "_COMPUTE_GATE", gate)
+
+    t_reh, res_reh = _post_async_on(
+        server, f"/api/isolation-jobs/{jid}/rehearsal",
+        {"version": 0, "pipes": ["P1", "P2"]})
+    assert gate.arrived.wait(timeout=5)
+    gate.released.set()
+    t_reh.join(timeout=5)
+    response = res_reh["response"]
+    assert response.status_code == 200
+    d = response.json()["rehearsal"]
+    assert d["status"] == "not_confirmed"
+    assert d["minimum_confirmed"] is False
+    _strict_json_loads(response.text)
+    # 作业仍只读不变
+    got = server.get(f"/api/isolation-jobs/{jid}").json()["job"]
+    assert got["version"] == 0 and got["closed_pipes"] == []
