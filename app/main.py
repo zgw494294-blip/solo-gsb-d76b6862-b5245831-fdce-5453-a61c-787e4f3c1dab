@@ -234,9 +234,13 @@ async def rehearse_isolation_plan(job_id: str, request: Request) -> JSONResponse
     “无法确认”，绝不当作不可行。预演不推进版本、不改需水量或快照；搜索
     在工作线程进行，不阻塞读取与其他作业。
 
-    请求时或计算结束时版本已变返回 409 与 current_version；未知或已结束
-    作业返回 404——结束优先于冲突及计算错误（计算结束后才结束的作业同样
-    按 404，不返回 200/422/409）。
+    响应优先级（rehearse_switch_plan 的**每个计算出口**——正常结果、搜索
+    的原错误、以及 RuntimeError 等意外异常——都先经过同一道复核）：
+    作业已结束（或计算期间被结束）返回 404；作业仍存在但版本已被推进返回
+    409 与 current_version；二者同时成立时结束优先（仍为 404）；只有存续
+    且版本未变时才处理原结果（200）或原错误（如 422）。计算替身/底层数值
+    故障抛出的意外异常在作业存续且版本未变时仍按原服务器错误处理，绝不改
+    报“不可行/无法确认”；预演始终只读，绝不恢复已结束作业或覆盖新状态。
     """
     payload, bad = await _load_payload(
         request,
@@ -246,23 +250,11 @@ async def rehearse_isolation_plan(job_id: str, request: Request) -> JSONResponse
     try:
         result = await run_in_threadpool(rehearse_switch_plan, job_id, payload)
     except _ISOLATION_ERRORS as exc:
-        # rehearse_switch_plan 在锁外计算期间无法观察结束/版本变化：这里的
-        # 映射只覆盖入参校验等同步抛出的错误；计算结束后的二次核对在下方。
+        # 复核在 rehearse_switch_plan 内部完成：请求时与计算结束时的结束/版本
+        # 变化都在此映射为 404/409；作业存续且版本未变时的原错误（如入参校验
+        # 422）同样在此映射。意外异常（RuntimeError 等）不在此列，作业未变化时
+        # 原样外逸，由服务器错误处理，绝不改报 infeasible/not_confirmed。
         return _isolation_error(exc)
-
-    # 计算结束时再次核对：结束优先于版本冲突（若二者同时成立，按 404）
-    try:
-        current = get_snapshot(job_id)
-    except JobNotFoundError:
-        return _isolation_error(JobNotFoundError(job_id))
-    if current["version"] != result["base_version"]:
-        return JSONResponse(status_code=409, content={
-            "ok": False,
-            "error": (
-                f"版本冲突：请求携带的版本为 {result['base_version']}，"
-                f"作业当前版本已为 {current['version']}；预演基于旧版本完成，"
-                "其关闭集合或需水量可能已不是当前状态，请重新读取最新快照后再试。"),
-            "current_version": current["version"]})
     return JSONResponse(content={"ok": True, "rehearsal": result})
 
 

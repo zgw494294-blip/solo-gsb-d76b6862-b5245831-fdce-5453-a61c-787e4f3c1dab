@@ -8,6 +8,10 @@
 两种）、预演不推进版本/不改需水量/不改快照、版本冲突 409、结束优先于
 冲突与计算错误（门暂停期间结束，放行后 404）、计算不阻塞健康检查/读取/
 其他作业、2～6 根互异现有管段等全部输入校验，以及响应严格 JSON 可编码。
+另用“可暂停并放行、放行后抛 RuntimeError 的计算替身”覆盖**异常出口**：
+搜索期间结束（放行后 404 而非 500）、版本推进（409 与 current_version）、
+结束与版本推进同时发生（结束优先仍 404），以及作业存续且版本未变时
+意外异常保持 500（绝不改报 infeasible/not_confirmed，且不改状态）。
 """
 
 from __future__ import annotations
@@ -610,6 +614,35 @@ class _PausableCompute:
             raise AssertionError("求解门在超时内未被放行，测试疑似死锁")
 
 
+class _PausableFailingCompute(_PausableCompute):
+    """可暂停并放行的**计算替身**：放行后不是继续搜索，而是抛出意外异常。
+
+    与仅暂停的求解门同款，命中 (job_id, stage="rehearse", closed) 的第一次
+    预演时阻塞在 arrived/released 上，供测试在暂停期间结束作业或推进版本；
+    被放行后统一抛出 RuntimeError（消息可用 message 定制），模拟“搜索尚未
+    完成时计算替身/底层数值故障抛出意外异常”。其他 stage（create/toggle/
+    revise）与未命中的调用全部直通，因此暂停期间的结束、读取与其他作业
+    操作都能正常完成。该替身只用于预演，绝不接触作业状态。
+    """
+
+    def __init__(self, *, job_id, closed=frozenset(), hold_seconds=5.0,
+                 message="模拟计算替身在搜索期间抛出意外异常"):
+        super().__init__(job_id=job_id, stage="rehearse",
+                         closed=closed, hold_seconds=hold_seconds)
+        self._message = message
+
+    def __call__(self, gate_job_id, stage, *, version, closed):
+        hit = (gate_job_id == self._want_job and stage == self._want_stage
+               and frozenset(closed) == self._want_closed)
+        if not hit or not self._claimed.acquire(blocking=False):
+            return
+        self.arrived.set()
+        if not self.released.wait(timeout=self._hold):
+            raise AssertionError("求解门在超时内未被放行，测试疑似死锁")
+        # 放行即抛意外异常：进入 rehearse_switch_plan 的“异常出口”复核
+        raise RuntimeError(self._message)
+
+
 import socket  # noqa: E402
 
 import httpx  # noqa: E402
@@ -649,12 +682,12 @@ def _create_on(http, payload) -> dict:
     return resp.json()["job"]
 
 
-def _post_async_on(http, path, body):
+def _post_async_on(http, path, body, *, headers=None):
     result: dict[str, object] = {}
 
     def worker():
         try:
-            result["response"] = http.post(path, json=body)
+            result["response"] = http.post(path, json=body, headers=headers)
         except Exception as exc:  # noqa: BLE001
             result["error"] = exc
 
@@ -779,3 +812,146 @@ def test_http_rehearse_terminate_and_version_both_ended_is_404(server, monkeypat
     gate.released.set()
     t_reh.join(timeout=5)
     assert res_reh["response"].status_code == 404
+
+
+# --------------- 计算替身抛意外异常时的出口复核（异常不得跳过复核） --------------- #
+def test_http_rehearse_unexpected_error_after_terminate_returns_404(
+        server, monkeypatch):
+    """回归：搜索尚未完成时结束作业，随后计算抛出 RuntimeError——必须 404 而非 500。
+
+    修复前意外异常直接逸出，跳过计算结束后的结束/版本复核，导致已结束作业
+    收到 500；现在所有计算出口（含异常出口）都先复核：已结束优先，按 404。
+    暂停期间健康检查、读取与其他作业照常响应；异常路径同样不恢复作业。
+    """
+    job = _create_on(server, _tree_payload(allow=["A", "B"]))
+    jid = job["job_id"]
+    other = _create_on(server, _loop_payload())
+    gate = _PausableFailingCompute(job_id=jid, closed=frozenset())
+    monkeypatch.setattr(iso, "_COMPUTE_GATE", gate)
+
+    t_reh, res_reh = _post_async_on(
+        server, f"/api/isolation-jobs/{jid}/rehearsal",
+        {"version": 0, "pipes": ["P1", "P2"]})
+    assert gate.arrived.wait(timeout=5)
+
+    # 搜索不持作业锁：暂停期间读取、结束与其他作业仍能响应
+    assert server.get("/api/health").status_code == 200
+    assert server.get(f"/api/isolation-jobs/{jid}").status_code == 200
+    resp = server.post(f"/api/isolation-jobs/{other['job_id']}/toggle",
+                       json={"version": 0, "pipe_id": "P3"})
+    assert resp.status_code == 200 and resp.json()["job"]["version"] == 1
+    # 搜索尚未完成时结束作业（DELETE 立即返回）
+    assert server.delete(f"/api/isolation-jobs/{jid}").status_code == 200
+
+    # 放行：计算替身随即抛 RuntimeError；异常出口必须先看到结束标记
+    gate.released.set()
+    t_reh.join(timeout=5)
+    assert not t_reh.is_alive()
+    assert "error" not in res_reh, res_reh.get("error")
+    response = res_reh["response"]
+    assert response.status_code == 404, response.text
+    assert "不存在" in response.json()["error"]
+    # 绝不是 200 的预演结论：异常不得被包装成 infeasible/not_confirmed
+    body = response.text
+    assert "infeasible" not in body and "not_confirmed" not in body
+    assert "无法确认" not in body and "不可行" not in body
+    # 预演（含异常路径）不恢复已结束作业
+    assert server.get(f"/api/isolation-jobs/{jid}").status_code == 404
+
+
+def test_http_rehearse_unexpected_error_after_version_advance_returns_409(
+        server, monkeypatch):
+    """搜索期间版本被成功操作推进，随后计算抛 RuntimeError：409 + current_version。"""
+    job = _create_on(server, _tree_payload(allow=["A", "B"]))
+    jid = job["job_id"]
+    gate = _PausableFailingCompute(job_id=jid, closed=frozenset())
+    monkeypatch.setattr(iso, "_COMPUTE_GATE", gate)
+
+    t_reh, res_reh = _post_async_on(
+        server, f"/api/isolation-jobs/{jid}/rehearsal",
+        {"version": 0, "pipes": ["P1", "P2"]})
+    assert gate.arrived.wait(timeout=5)
+    # 计算期间成功切换：v0 -> v1
+    resp = server.post(f"/api/isolation-jobs/{jid}/toggle",
+                       json={"version": 0, "pipe_id": "P2"})
+    assert resp.status_code == 200 and resp.json()["job"]["version"] == 1
+
+    gate.released.set()
+    t_reh.join(timeout=5)
+    response = res_reh["response"]
+    assert response.status_code == 409, response.text
+    data = response.json()
+    assert data["ok"] is False and data["current_version"] == 1
+    assert "版本冲突" in data["error"]
+    # 异常路径不覆盖新状态：作业保持切换提交的 v1
+    got = server.get(f"/api/isolation-jobs/{jid}").json()["job"]
+    assert got["version"] == 1 and got["closed_pipes"] == ["P2"]
+
+
+def test_http_rehearse_unexpected_error_terminate_and_version_advance_returns_404(
+        server, monkeypatch):
+    """异常出口上版本已推进且作业已结束：仍按 404（结束优先于冲突）。"""
+    job = _create_on(server, _tree_payload(allow=["A", "B"]))
+    jid = job["job_id"]
+    gate = _PausableFailingCompute(job_id=jid, closed=frozenset())
+    monkeypatch.setattr(iso, "_COMPUTE_GATE", gate)
+
+    t_reh, res_reh = _post_async_on(
+        server, f"/api/isolation-jobs/{jid}/rehearsal",
+        {"version": 0, "pipes": ["P1", "P2"]})
+    assert gate.arrived.wait(timeout=5)
+    assert server.post(f"/api/isolation-jobs/{jid}/toggle",
+                       json={"version": 0, "pipe_id": "P2"}).status_code == 200
+    assert server.delete(f"/api/isolation-jobs/{jid}").status_code == 200
+
+    gate.released.set()
+    t_reh.join(timeout=5)
+    response = res_reh["response"]
+    assert response.status_code == 404, response.text
+    assert server.get(f"/api/isolation-jobs/{jid}").status_code == 404
+
+
+def test_http_rehearse_unexpected_error_unchanged_job_is_server_error(
+        server, monkeypatch):
+    """作业存续且版本未变时计算抛 RuntimeError：仍是 500，绝不改报不可行/无法确认。
+
+    意外异常不得被翻译成任何预演结论或业务状态码；作业状态保持原状，随后
+    （替身只命中一次）携带同版本重新预演可正常得到 feasible。
+    """
+    job = _create_on(server, _tree_payload(allow=["A", "B"]))
+    jid = job["job_id"]
+    gate = _PausableFailingCompute(job_id=jid, closed=frozenset())
+    monkeypatch.setattr(iso, "_COMPUTE_GATE", gate)
+
+    t_reh, res_reh = _post_async_on(
+        server, f"/api/isolation-jobs/{jid}/rehearsal",
+        {"version": 0, "pipes": ["P1", "P2"]},
+        # 未捕获异常的 500 响应会令 uvicorn 关闭该 keep-alive 连接；
+        # 显式声明 close，避免后续请求复用了被 RST 的连接。
+        headers={"Connection": "close"})
+    assert gate.arrived.wait(timeout=5)
+    # 暂停期间不结束、也不推进版本
+    assert server.get("/api/health").status_code == 200
+    assert server.get(f"/api/isolation-jobs/{jid}").json()["job"]["version"] == 0
+
+    gate.released.set()
+    t_reh.join(timeout=5)
+    assert "error" not in res_reh, res_reh.get("error")
+    response = res_reh["response"]
+    # 原服务器错误语义保持：500，而不是 404/409/422/200
+    assert response.status_code == 500, response.text
+    body = response.text
+    assert "infeasible" not in body and "not_confirmed" not in body
+    assert "无法确认" not in body and "不可行" not in body
+    # 异常不改任何状态：仍是 v0、全部开启
+    got = server.get(f"/api/isolation-jobs/{jid}").json()["job"]
+    assert got["version"] == 0 and got["closed_pipes"] == []
+    # 同版本重新预演（计算替身只命中一次，此次直通）恢复正常结论
+    resp = server.post(f"/api/isolation-jobs/{jid}/rehearsal",
+                       json={"version": 0, "pipes": ["P1", "P2"]})
+    assert resp.status_code == 200, resp.text
+    d = resp.json()["rehearsal"]
+    assert d["status"] == "feasible"
+    assert d["plan"]["pipe_order"] == ["P1", "P2"]
+    got = server.get(f"/api/isolation-jobs/{jid}").json()["job"]
+    assert got["version"] == 0 and got["closed_pipes"] == []

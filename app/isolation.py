@@ -52,9 +52,12 @@
 必须满足同一套允许失供/最低水头/稳态收敛规则；按管段录入序号序列的
 字典序取最小的可行顺序。搜索途中任何状态求解不收敛或出现非有限数（含
 聚合溢出）都只令结论变为“无法确认”，绝不当作不可行。预演在锁外计算，
-不推进版本、不改需水量或快照，也不阻塞读取和其他作业；作业在请求时或
-计算结束时已被结束返回 404（结束优先于冲突与计算错误），版本已变返回
-409 与 current_version。
+不推进版本、不改需水量或快照，也不阻塞读取和其他作业。**所有计算出口**
+（正常返回、搜索的原错误、RuntimeError 等意外异常）都先经过同一道结束/
+版本复核：作业在请求时或计算结束时已被结束返回 404（结束优先于冲突与
+计算错误，即使意外异常原本会逸出也一样），版本已变返回 409 与
+current_version，存续且版本未变才返回原结果或抛出原错误（意外异常保持
+原服务器错误语义，绝不改报 infeasible/not_confirmed）。
 """
 
 from __future__ import annotations
@@ -85,11 +88,14 @@ class JobNotFoundError(KeyError):
 class VersionConflictError(RuntimeError):
     """请求携带的版本与作业当前版本不一致：同一版本最多允许一次成功提交。"""
 
-    def __init__(self, expected: int, current: int) -> None:
+    def __init__(self, expected: int, current: int, *,
+                 extra: str | None = None) -> None:
+        if extra is None:
+            extra = ("同一版本的修订与管段切换合计最多成功一次，"
+                     "请重新读取最新状态后再试。")
         super().__init__(
             f"版本冲突：请求携带的版本为 {expected}，作业当前版本已为 {current}；"
-            "同一版本的修订与管段切换合计最多成功一次，"
-            "请重新读取最新状态后再试。")
+            f"{extra}")
         self.expected = expected
         self.current = current
 
@@ -153,7 +159,9 @@ _REGISTRY_LOCK = threading.Lock()
 # 测试钩子：None（生产默认）表示直通；测试可替换为形如
 # gate(job_id, stage, *, version, closed) -> None 的可调用对象，
 # 在每次快照重算开始时同步调用并允许阻塞（作业锁在此时并不持有）。
-# stage 为 "create" / "toggle" / "revise" 之一。
+# stage 为 "create" / "toggle" / "revise" / "rehearse" 之一（预演只在
+# 搜索开始时触发一次）。替身也可在放行后直接抛异常，以覆盖预演异常出口
+# 与结束/版本推进的交错。
 _COMPUTE_GATE: Callable[..., None] | None = None
 
 
@@ -792,8 +800,13 @@ def rehearse_switch_plan(job_id: str, payload: Any) -> dict[str, Any]:
 
     纯计算语义：不推进版本、不改需水量或快照，计算在 HTTP 层放入工作线程，
     不阻塞读取与其他作业。版本不一致抛 VersionConflictError；作业不存在或
-    已结束抛 JobNotFoundError（HTTP 层保证结束优先于冲突与计算错误，并在
-    计算结束时再次核对结束标记与版本）。
+    已结束抛 JobNotFoundError（结束优先于冲突与计算错误）。**所有计算出口**
+    （正常返回、搜索抛出的原错误、以及计算替身/底层数值故障抛出的 RuntimeError
+    等意外异常）都必须先经过同一道结束/版本复核：作业已结束（或计算期间被
+    结束）一律转成 JobNotFoundError（404）；作业仍存在但版本已被推进则转成
+    VersionConflictError（409，携带 current_version）；只有作业存续且版本
+    未变时，才返回原结果或把原异常原样抛出——意外异常绝不改报为“不可行”或
+    “无法确认”，预演也绝不会恢复已结束作业或覆盖新状态。
     """
     with _REGISTRY_LOCK:
         job = _JOBS.get(job_id)
@@ -819,174 +832,206 @@ def rehearse_switch_plan(job_id: str, payload: Any) -> dict[str, Any]:
         net = job.network
         allowed = job.allowed_unserved
 
+    def _review_after_compute() -> None:
+        """计算出口的统一复核（短暂持作业锁，搜索期间不持锁，故不会与计算互锁）。
+
+        优先级固定：先看结束标记——已结束（含计算期间被结束）一律 404，绝不
+        恢复作业；作业仍存在再看版本——计算期间被成功操作推进则 409 并携带
+        当前版本，绝不覆盖新状态；存续且版本未变时放行，由调用方处理原结果
+        或原错误。
+        """
+        with job.lock:
+            if job.terminated:
+                raise JobNotFoundError(job_id)
+            if job.version != base_version:
+                raise VersionConflictError(
+                    base_version, job.version,
+                    extra="预演基于旧版本完成，其关闭集合或需水量可能已不是当前"
+                          "状态，请重新读取最新快照后再试。")
+
     # 搜索只在开始时触发一次测试求解门（stage="rehearse"），位置在任何规则
-    # 判定与求解器调用之前；生产环境 _COMPUTE_GATE 为 None（直通）。
-    if _COMPUTE_GATE is not None:
-        _COMPUTE_GATE(job.job_id, "rehearse",
-                      version=base_version, closed=base_closed)
+    # 判定与求解器调用之前；生产环境 _COMPUTE_GATE 为 None（直通）。gate 与
+    # 整段搜索同处一个 try：计算期间的**任何**出口（正常完成、搜索自身的错误、
+    # 或计算替身/底层数值故障抛出的 RuntimeError 等意外异常）都先经过上面的
+    # 结束/版本复核，绝不允许异常直接逸出而跳过复核。
+    try:
+        if _COMPUTE_GATE is not None:
+            _COMPUTE_GATE(job.job_id, "rehearse",
+                          version=base_version, closed=base_closed)
 
-    k = len(pipes)
-    total_orders = math.factorial(k)
+        k = len(pipes)
+        total_orders = math.factorial(k)
 
-    # 记忆化（关闭集合 -> 评估结论）：同一集合无论经由哪条排列前缀到达，
-    # 结论完全一致，至多评估 2^k-1 个非基态集合。值为：
-    #   ("legal", 状态体) / ("illegal", 异常) / ("unknown", 异常)
-    memo: dict[frozenset[str], tuple[str, Any]] = {}
-    # “无法确认”记录按 DFS 首次遇到顺序；只记录被搜索实际遍历到的前缀
-    unconfirmed_records: list[dict[str, Any]] = []
-    evaluated_states = 0
+        # 记忆化（关闭集合 -> 评估结论）：同一集合无论经由哪条排列前缀到达，
+        # 结论完全一致，至多评估 2^k-1 个非基态集合。值为：
+        #   ("legal", 状态体) / ("illegal", 异常) / ("unknown", 异常)
+        memo: dict[frozenset[str], tuple[str, Any]] = {}
+        # “无法确认”记录按 DFS 首次遇到顺序；只记录被搜索实际遍历到的前缀
+        unconfirmed_records: list[dict[str, Any]] = []
+        evaluated_states = 0
 
-    def classify(closed: frozenset[str],
-                 prefix: tuple[str, ...]) -> str:
-        nonlocal evaluated_states
-        cached = memo.get(closed)
-        if cached is not None:
-            # 记忆命中不重复记录：同一集合的首个到达前缀已在首次评估时记录
-            return cached[0]
-        evaluated_states += 1
-        try:
-            state = _evaluate_closed_set(net, allowed, closed)
-        except _IllegalStateError as exc:
-            memo[closed] = ("illegal", exc)
-            return "illegal"
-        except StateUnconfirmedError as exc:
-            memo[closed] = ("unknown", exc)
-            unconfirmed_records.append(_unconfirmed_record(pipes, prefix, exc))
-            return "unknown"
-        memo[closed] = ("legal", state)
-        return "legal"
+        def classify(closed: frozenset[str],
+                     prefix: tuple[str, ...]) -> str:
+            nonlocal evaluated_states
+            cached = memo.get(closed)
+            if cached is not None:
+                # 记忆命中不重复记录：同一集合的首个到达前缀已在首次评估时记录
+                return cached[0]
+            evaluated_states += 1
+            try:
+                state = _evaluate_closed_set(net, allowed, closed)
+            except _IllegalStateError as exc:
+                memo[closed] = ("illegal", exc)
+                return "illegal"
+            except StateUnconfirmedError as exc:
+                memo[closed] = ("unknown", exc)
+                unconfirmed_records.append(_unconfirmed_record(pipes, prefix, exc))
+                return "unknown"
+            memo[closed] = ("legal", state)
+            return "legal"
 
-    found_order: tuple[str, ...] | None = None
+        found_order: tuple[str, ...] | None = None
 
-    def dfs(chosen: tuple[str, ...], closed: frozenset[str]) -> bool:
-        """按录入序号字典序枚举排列；首个合法全路径找到即整体停止。"""
-        nonlocal found_order
-        if len(chosen) == k:
-            found_order = chosen
-            return True
-        for pid in pipes:  # 录入顺序 = 字典序展开顺序
-            if pid in chosen:
-                continue
-            next_chosen = chosen + (pid,)
-            next_closed = closed ^ {pid}
-            verdict = classify(next_closed, next_chosen)
-            if verdict == "unknown":
-                continue  # 无法确认：剪枝搜索，但绝不当作不可行
-            if verdict == "illegal":
-                continue  # 中间状态明确非法：该前缀的任何延伸都不合格
-            if dfs(next_chosen, next_closed):
+        def dfs(chosen: tuple[str, ...], closed: frozenset[str]) -> bool:
+            """按录入序号字典序枚举排列；首个合法全路径找到即整体停止。"""
+            nonlocal found_order
+            if len(chosen) == k:
+                found_order = chosen
                 return True
-        return False
+            for pid in pipes:  # 录入顺序 = 字典序展开顺序
+                if pid in chosen:
+                    continue
+                next_chosen = chosen + (pid,)
+                next_closed = closed ^ {pid}
+                verdict = classify(next_closed, next_chosen)
+                if verdict == "unknown":
+                    continue  # 无法确认：剪枝搜索，但绝不当作不可行
+                if verdict == "illegal":
+                    continue  # 中间状态明确非法：该前缀的任何延伸都不合格
+                if dfs(next_chosen, next_closed):
+                    return True
+            return False
 
-    dfs((), base_closed)
+        dfs((), base_closed)
 
-    counts = {"legal": 0, "illegal": 0, "unknown": 0}
-    for verdict, _ in memo.values():
-        counts[verdict] += 1
+        counts = {"legal": 0, "illegal": 0, "unknown": 0}
+        for verdict, _ in memo.values():
+            counts[verdict] += 1
 
-    if found_order is not None:
-        # 沿找到的顺序重放，逐步取记忆化中已算好的合法状态体
-        steps: list[dict[str, Any]] = []
-        closed = base_closed
-        for index, pid in enumerate(found_order, start=1):
-            was_closed = pid in closed
-            closed = closed ^ {pid}
-            state = memo[closed][1]
-            steps.append({
-                "step": index,
-                "pipe_id": pid,
-                "pipe_entry_index": pipes.index(pid) + 1,
-                "toggled_from": "closed" if was_closed else "open",
-                "action": "open" if was_closed else "close",
-                "toggled_to": "open" if was_closed else "closed",
-                "closed_pipes": state["closed_pipes"],
-                "open_pipes": state["open_pipes"],
-                "pipe_states": state["pipe_states"],
-                "unserved_nodes": state["unserved_nodes"],
-                "unserved_demand": state["unserved_demand"],
-                "component_nodes": state["component_nodes"],
-                "component_pipes": state["component_pipes"],
-                "source_only": state["source_only"],
-                "source_supply": state["source_supply"],
-                "total_demand": state["total_demand"],
-                "solution": state["solution"],
-            })
-        final_state = memo[closed][1]
-        plan: dict[str, Any] | None = {
-            "pipe_order": list(found_order),
-            "pipe_entry_indices": [pipes.index(pid) + 1 for pid in found_order],
-            "steps": steps,
-            "final_closed_pipes": final_state["closed_pipes"],
-            "final_open_pipes": final_state["open_pipes"],
-            "final_pipe_states": final_state["pipe_states"],
-            "final_unserved_nodes": final_state["unserved_nodes"],
-            "final_unserved_demand": final_state["unserved_demand"],
-            "final_component_nodes": final_state["component_nodes"],
-            "final_component_pipes": final_state["component_pipes"],
-            "final_source_only": final_state["source_only"],
-            "final_source_supply": final_state["source_supply"],
-            "final_total_demand": final_state["total_demand"],
-            "final_solution": final_state["solution"],
+        if found_order is not None:
+            # 沿找到的顺序重放，逐步取记忆化中已算好的合法状态体
+            steps: list[dict[str, Any]] = []
+            closed = base_closed
+            for index, pid in enumerate(found_order, start=1):
+                was_closed = pid in closed
+                closed = closed ^ {pid}
+                state = memo[closed][1]
+                steps.append({
+                    "step": index,
+                    "pipe_id": pid,
+                    "pipe_entry_index": pipes.index(pid) + 1,
+                    "toggled_from": "closed" if was_closed else "open",
+                    "action": "open" if was_closed else "close",
+                    "toggled_to": "open" if was_closed else "closed",
+                    "closed_pipes": state["closed_pipes"],
+                    "open_pipes": state["open_pipes"],
+                    "pipe_states": state["pipe_states"],
+                    "unserved_nodes": state["unserved_nodes"],
+                    "unserved_demand": state["unserved_demand"],
+                    "component_nodes": state["component_nodes"],
+                    "component_pipes": state["component_pipes"],
+                    "source_only": state["source_only"],
+                    "source_supply": state["source_supply"],
+                    "total_demand": state["total_demand"],
+                    "solution": state["solution"],
+                })
+            final_state = memo[closed][1]
+            plan: dict[str, Any] | None = {
+                "pipe_order": list(found_order),
+                "pipe_entry_indices": [pipes.index(pid) + 1 for pid in found_order],
+                "steps": steps,
+                "final_closed_pipes": final_state["closed_pipes"],
+                "final_open_pipes": final_state["open_pipes"],
+                "final_pipe_states": final_state["pipe_states"],
+                "final_unserved_nodes": final_state["unserved_nodes"],
+                "final_unserved_demand": final_state["unserved_demand"],
+                "final_component_nodes": final_state["component_nodes"],
+                "final_component_pipes": final_state["component_pipes"],
+                "final_source_only": final_state["source_only"],
+                "final_source_supply": final_state["source_supply"],
+                "final_total_demand": final_state["total_demand"],
+                "final_solution": final_state["solution"],
+            }
+            if unconfirmed_records:
+                # 可行顺序已找到，但其字典序最小性无法确认：更靠前的分支含
+                # “无法确认”状态，那里可能藏着更小的可行顺序。
+                status = "not_confirmed"
+                confirmed = False
+                conclusion = (
+                    "已找到一条全部中间状态与终态均合法的切换顺序 "
+                    f"（{' → '.join(found_order)}，终态关闭 "
+                    f"{('、'.join(final_state['closed_pipes']) or '（无）')}），"
+                    "但按管段录入序号序列字典序排在它之前的搜索分支中存在求解不收敛"
+                    "或非有限数的状态，无法确认该顺序就是字典序最小的可行顺序"
+                    "（搜索途中的无法确认不能当作不可行）。")
+            else:
+                status = "feasible"
+                confirmed = True
+                conclusion = (
+                    f"在全部 {total_orders} 种每根恰好切换一次的顺序中，"
+                    "字典序最小且所有中间状态与终态均合法的切换顺序为 "
+                    f"{' → '.join(found_order)}，终态关闭 "
+                    f"{('、'.join(final_state['closed_pipes']) or '（无）')}，"
+                    f"失供节点 "
+                    f"{('、'.join(final_state['unserved_nodes']) or '无')}，"
+                    f"失供总量 {final_state['unserved_demand']:g}。"
+                    "预演不推进版本、不改需水量或快照。")
+        else:
+            plan = None
+            if unconfirmed_records:
+                status = "not_confirmed"
+                confirmed = False
+                conclusion = (
+                    "未能在已确认合法的状态中找到可执行顺序，但搜索分支中存在求解"
+                    "不收敛或非有限数的状态，无法确认是否真的无可行顺序"
+                    "（搜索途中的无法确认不能当作不可行）。")
+            else:
+                status = "infeasible"
+                confirmed = True
+                conclusion = (
+                    f"全部 {total_orders} 种每根恰好切换一次的顺序均至少有一个中间"
+                    "状态或终态不满足隔离规则（失供超出允许集合或最低水头限值），"
+                    "不存在可执行的切换顺序。")
+
+        result = {
+            "status": status,
+            "minimum_confirmed": confirmed,
+            "job_id": job_id,
+            "base_version": base_version,
+            "requested_pipes": list(pipes),
+            "requested_pipe_entry_indices": [
+                [p["id"] for p in net.pipes].index(pid) + 1 for pid in pipes],
+            "pipe_count": k,
+            "total_orders": total_orders,
+            "evaluated_states": evaluated_states,
+            "distinct_states": len(memo) + 1,  # 含未重新评估的基态
+            "state_counts": {"legal": counts["legal"],
+                             "illegal": counts["illegal"],
+                             "unconfirmed": counts["unknown"]},
+            "unconfirmed_states": unconfirmed_records,
+            "base_closed_pipes": list(base_snapshot["closed_pipes"]),
+            "base_snapshot": base_snapshot,
+            "plan": plan,
+            "conclusion": conclusion,
         }
-        if unconfirmed_records:
-            # 可行顺序已找到，但其字典序最小性无法确认：更靠前的分支含
-            # “无法确认”状态，那里可能藏着更小的可行顺序。
-            status = "not_confirmed"
-            confirmed = False
-            conclusion = (
-                "已找到一条全部中间状态与终态均合法的切换顺序 "
-                f"（{' → '.join(found_order)}，终态关闭 "
-                f"{('、'.join(final_state['closed_pipes']) or '（无）')}），"
-                "但按管段录入序号序列字典序排在它之前的搜索分支中存在求解不收敛"
-                "或非有限数的状态，无法确认该顺序就是字典序最小的可行顺序"
-                "（搜索途中的无法确认不能当作不可行）。")
-        else:
-            status = "feasible"
-            confirmed = True
-            conclusion = (
-                f"在全部 {total_orders} 种每根恰好切换一次的顺序中，"
-                "字典序最小且所有中间状态与终态均合法的切换顺序为 "
-                f"{' → '.join(found_order)}，终态关闭 "
-                f"{('、'.join(final_state['closed_pipes']) or '（无）')}，"
-                f"失供节点 "
-                f"{('、'.join(final_state['unserved_nodes']) or '无')}，"
-                f"失供总量 {final_state['unserved_demand']:g}。"
-                "预演不推进版本、不改需水量或快照。")
-    else:
-        plan = None
-        if unconfirmed_records:
-            status = "not_confirmed"
-            confirmed = False
-            conclusion = (
-                "未能在已确认合法的状态中找到可执行顺序，但搜索分支中存在求解"
-                "不收敛或非有限数的状态，无法确认是否真的无可行顺序"
-                "（搜索途中的无法确认不能当作不可行）。")
-        else:
-            status = "infeasible"
-            confirmed = True
-            conclusion = (
-                f"全部 {total_orders} 种每根恰好切换一次的顺序均至少有一个中间"
-                "状态或终态不满足隔离规则（失供超出允许集合或最低水头限值），"
-                "不存在可执行的切换顺序。")
-
-    return {
-        "status": status,
-        "minimum_confirmed": confirmed,
-        "job_id": job_id,
-        "base_version": base_version,
-        "requested_pipes": list(pipes),
-        "requested_pipe_entry_indices": [
-            [p["id"] for p in net.pipes].index(pid) + 1 for pid in pipes],
-        "pipe_count": k,
-        "total_orders": total_orders,
-        "evaluated_states": evaluated_states,
-        "distinct_states": len(memo) + 1,  # 含未重新评估的基态
-        "state_counts": {"legal": counts["legal"],
-                         "illegal": counts["illegal"],
-                         "unconfirmed": counts["unknown"]},
-        "unconfirmed_states": unconfirmed_records,
-        "base_closed_pipes": list(base_snapshot["closed_pipes"]),
-        "base_snapshot": base_snapshot,
-        "plan": plan,
-        "conclusion": conclusion,
-    }
+    except Exception:
+        # 意外异常出口（如计算替身/数值故障抛出的 RuntimeError）：先复核结束
+        # 与版本——已结束转 404、版本已变转 409（原异常不再外逸）；作业存续
+        # 且版本未变时才把原异常原样抛出（HTTP 层按服务器错误处理），绝不改
+        # 报 infeasible / not_confirmed，也不改变任何作业状态。
+        _review_after_compute()
+        raise
+    # 正常出口同样先复核：计算期间被结束 -> 404，版本被推进 -> 409，
+    # 二者同时成立时结束优先；都未发生才返回原预演结果。
+    _review_after_compute()
+    return result
